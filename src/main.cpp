@@ -8,24 +8,60 @@ constexpr uint8_t kMaxTargets = VL53L4CX_MAX_RANGE_RESULTS;
 constexpr uint8_t kSensorCount = 2;
 constexpr uint8_t kMuxAddress = 0x70;
 constexpr uint8_t kMuxPorts[kSensorCount] = {0, 1};
-constexpr uint16_t kSensorSpacingMm = 100;
-constexpr uint16_t kObjectMaxRangeMm = 300;
+constexpr uint32_t kI2cClockHz = 1000000;
+constexpr uint32_t kTimingBudgetUs = 15000;
+constexpr uint16_t kSensorSpacingMm = 270;
+constexpr uint16_t kObjectMaxRangeMm = 150;
+constexpr uint8_t kClearSamplesRequired = 3;
 constexpr float kHoScaleRatio = 87.0f;
 constexpr float kMmPerMeter = 1000.0f;
 constexpr float kMsPerSecond = 1000.0f;
+constexpr float kUsPerSecond = 1000000.0f;
+constexpr float kMphToMps = 0.44704f;
 constexpr float kMpsToMph = 2.23693629f;
-constexpr uint32_t kLedBlinkMs = 50;
+constexpr float kMinScaleMph = 0.0f;
+constexpr float kMaxScaleMph = 160.0f;
+constexpr float kSensorSpacingMeters =
+    static_cast<float>(kSensorSpacingMm) / kMmPerMeter;
+constexpr float kMaxSpeedMps = (kMaxScaleMph / kHoScaleRatio) * kMphToMps;
+constexpr uint32_t kMinTransitUs = static_cast<uint32_t>(
+    (kSensorSpacingMeters / kMaxSpeedMps) * kUsPerSecond + 0.5f);
+constexpr uint32_t kStatsIntervalUs = 15000000;
+constexpr uint32_t kTransitTimeoutUs = 30000000;
+constexpr uint32_t kWaitLogIntervalUs = 1000000;
+constexpr uint8_t kDebounceSamples = 3;
+constexpr bool kDebugSensorState = true;
+constexpr bool kDebugTransitState = true;
 
 VL53L4CX tof0(&Wire, XSHUT_PIN);
 VL53L4CX tof1(&Wire, XSHUT_PIN);
 VL53L4CX *const kSensors[kSensorCount] = {&tof0, &tof1};
 
 static bool objectBlocked[kSensorCount] = {};
+static bool objectPresentState[kSensorCount] = {};
+static bool lastObjectPresentState[kSensorCount] = {};
+static uint8_t presentStreak[kSensorCount] = {};
+static uint8_t clearStreak[kSensorCount] = {};
+static uint8_t clearSamples[kSensorCount] = {};
+static bool transitArmed = false;
 static bool waitingForSecondSensor = false;
 static uint8_t firstSensorIndex = 0;
-static uint32_t firstBlockMs = 0;
-static bool ledOn = false;
-static uint32_t ledOffMs = 0;
+static uint32_t firstBlockUs = 0;
+static uint32_t lastWaitLogUs = 0;
+static uint32_t measurementStartUs[kSensorCount] = {};
+static uint32_t lastStatsReportUs = 0;
+static uint32_t lastMeasAvgUs[kSensorCount] = {};
+static uint32_t lastMeasMaxUs[kSensorCount] = {};
+
+struct TimingStats {
+  uint32_t min;
+  uint32_t max;
+  uint64_t sum;
+  uint32_t count;
+};
+
+static TimingStats measurementStats[kSensorCount];
+static TimingStats transferStats[kSensorCount];
 
 static bool selectMuxChannel(uint8_t channel)
 {
@@ -90,6 +126,70 @@ static void printSensorInfo(VL53L4CX &sensor, uint8_t sensorIndex)
   }
 }
 
+static void resetTimingStats(TimingStats &stats)
+{
+  stats.min = UINT32_MAX;
+  stats.max = 0;
+  stats.sum = 0;
+  stats.count = 0;
+}
+
+static void updateTimingStats(TimingStats &stats, uint32_t value)
+{
+  if (value < stats.min) {
+    stats.min = value;
+  }
+  if (value > stats.max) {
+    stats.max = value;
+  }
+  stats.sum += value;
+  stats.count += 1;
+}
+
+static void cacheMeasurementStats(uint8_t sensorIndex)
+{
+  if (sensorIndex >= kSensorCount) {
+    return;
+  }
+
+  const TimingStats &stats = measurementStats[sensorIndex];
+  if (stats.count > 0) {
+    lastMeasAvgUs[sensorIndex] = static_cast<uint32_t>(stats.sum / stats.count);
+    lastMeasMaxUs[sensorIndex] = stats.max;
+  }
+}
+
+static bool getMeasurementAvgMaxUs(uint8_t sensorIndex,
+                                   uint32_t *avgUs,
+                                   uint32_t *maxUs)
+{
+  if (sensorIndex >= kSensorCount) {
+    return false;
+  }
+
+  const TimingStats &stats = measurementStats[sensorIndex];
+  if (stats.count > 0) {
+    if (avgUs != nullptr) {
+      *avgUs = static_cast<uint32_t>(stats.sum / stats.count);
+    }
+    if (maxUs != nullptr) {
+      *maxUs = stats.max;
+    }
+    return true;
+  }
+
+  if (lastMeasAvgUs[sensorIndex] > 0) {
+    if (avgUs != nullptr) {
+      *avgUs = lastMeasAvgUs[sensorIndex];
+    }
+    if (maxUs != nullptr) {
+      *maxUs = lastMeasMaxUs[sensorIndex];
+    }
+    return true;
+  }
+
+  return false;
+}
 
 static bool findNearestObjectWithin(const VL53L4CX_MultiRangingData_t &data,
                                     uint16_t maxRangeMm,
@@ -116,27 +216,55 @@ static bool findNearestObjectWithin(const VL53L4CX_MultiRangingData_t &data,
 
 static void reportTransitSpeed(uint8_t startSensor,
                                uint8_t endSensor,
-                               uint32_t deltaMs)
+                               uint32_t deltaUs)
 {
-  if (deltaMs == 0) {
+  if (deltaUs == 0) {
     return;
   }
-  float deltaSeconds = static_cast<float>(deltaMs) / kMsPerSecond;
+  uint32_t avgStartUs = 0;
+  uint32_t maxStartUs = 0;
+  uint32_t avgEndUs = 0;
+  uint32_t maxEndUs = 0;
+  bool haveStartStats =
+      getMeasurementAvgMaxUs(startSensor, &avgStartUs, &maxStartUs);
+  bool haveEndStats =
+      getMeasurementAvgMaxUs(endSensor, &avgEndUs, &maxEndUs);
+  uint32_t errUsTypical = 0;
+  if (haveStartStats && haveEndStats) {
+    errUsTypical = (avgStartUs + avgEndUs) / 2;
+  }
+
+  float deltaSeconds = static_cast<float>(deltaUs) / kUsPerSecond;
   float distanceMeters = static_cast<float>(kSensorSpacingMm) / kMmPerMeter;
   float speedMps = distanceMeters / deltaSeconds;
   float scaleMph = speedMps * kMpsToMph * kHoScaleRatio;
+  float deltaMs = static_cast<float>(deltaUs) / 1000.0f;
+  float speedErrMphTypical = 0.0f;
+  if (errUsTypical > 0 && deltaUs > errUsTypical) {
+    float ratio =
+        static_cast<float>(errUsTypical) / static_cast<float>(deltaUs);
+    speedErrMphTypical = scaleMph * ratio;
+  }
+  bool outOfRange = scaleMph < kMinScaleMph || scaleMph > kMaxScaleMph;
 
+  if (outOfRange) {
+    Serial.print("\x1b[31m");
+  }
   Serial.print("Transit dir=");
   Serial.print(startSensor);
   Serial.print("->");
   Serial.print(endSensor);
   Serial.print(" delta=");
-  Serial.print(deltaMs);
-  Serial.print("ms: ");
-  Serial.print(speedMps, 3);
-  Serial.print(" m/s, ");
+  Serial.print(deltaMs, 3);
+  Serial.print("ms mph=");
   Serial.print(scaleMph, 1);
-  Serial.println(" scale mph");
+  Serial.print(" +/-");
+  Serial.print(speedErrMphTypical, 1);
+  Serial.print(" scale mph");
+  if (outOfRange) {
+    Serial.print("\x1b[0m");
+  }
+  Serial.println();
 }
 
 void setup()
@@ -155,6 +283,7 @@ void setup()
   digitalWrite(LED_BUILTIN, LOW);
 
   Wire.begin();
+  Wire.setClock(kI2cClockHz);
 
   for (uint8_t i = 0; i < kSensorCount; ++i) {
     if (!selectMuxChannel(kMuxPorts[i])) {
@@ -190,6 +319,15 @@ void setup()
       Serial.println(status);
     }
 
+    status = sensor.VL53L4CX_SetMeasurementTimingBudgetMicroSeconds(
+        kTimingBudgetUs);
+    if (status != VL53L4CX_ERROR_NONE) {
+      Serial.print("TimingBudget warning on sensor ");
+      Serial.print(i);
+      Serial.print(": ");
+      Serial.println(status);
+    }
+
     status = sensor.VL53L4CX_StartMeasurement();
     if (status != VL53L4CX_ERROR_NONE) {
       Serial.print("StartMeasurement failed on sensor ");
@@ -200,7 +338,13 @@ void setup()
         delay(100);
       }
     }
+
+    measurementStartUs[i] = micros();
+    resetTimingStats(measurementStats[i]);
+    resetTimingStats(transferStats[i]);
   }
+
+  lastStatsReportUs = micros();
 }
 
 void loop()
@@ -226,30 +370,103 @@ void loop()
     }
 
     if (dataReady) {
-      uint32_t sampleMs = millis();
+      uint32_t sampleUs = micros();
+      updateTimingStats(measurementStats[i],
+                        static_cast<uint32_t>(sampleUs - measurementStartUs[i]));
       VL53L4CX_MultiRangingData_t data;
+      uint32_t transferStartUs = micros();
       status = sensor.VL53L4CX_GetMultiRangingData(&data);
+      uint32_t transferElapsedUs = micros() - transferStartUs;
+      updateTimingStats(transferStats[i], transferElapsedUs);
       if (status == VL53L4CX_ERROR_NONE) {
         bool objectPresent =
             findNearestObjectWithin(data, kObjectMaxRangeMm, nullptr);
         if (objectPresent) {
+          if (presentStreak[i] < UINT8_MAX) {
+            presentStreak[i] += 1;
+          }
+          clearStreak[i] = 0;
+        } else {
+          if (clearStreak[i] < UINT8_MAX) {
+            clearStreak[i] += 1;
+          }
+          presentStreak[i] = 0;
+        }
+
+        if (presentStreak[i] >= kDebounceSamples) {
+          objectPresentState[i] = true;
+        } else if (clearStreak[i] >= kDebounceSamples) {
+          objectPresentState[i] = false;
+        }
+
+        bool debouncedPresent = objectPresentState[i];
+        if (debouncedPresent != lastObjectPresentState[i]) {
+          if (kDebugSensorState) {
+            Serial.print("Sensor ");
+            Serial.print(i);
+            Serial.print(debouncedPresent ? " blocked" : " clear");
+            Serial.print(" at ");
+            Serial.print(static_cast<float>(sampleUs) / 1000.0f, 3);
+            Serial.println("ms");
+          }
+          lastObjectPresentState[i] = debouncedPresent;
+        }
+        if (debouncedPresent) {
+          clearSamples[i] = 0;
           if (!objectBlocked[i]) {
             objectBlocked[i] = true;
-            ledOn = true;
-            ledOffMs = sampleMs + kLedBlinkMs;
-            digitalWrite(LED_BUILTIN, HIGH);
             if (!waitingForSecondSensor) {
-              waitingForSecondSensor = true;
-              firstSensorIndex = i;
-              firstBlockMs = sampleMs;
-            } else if (i != firstSensorIndex) {
-              uint32_t deltaMs = sampleMs - firstBlockMs;
-              reportTransitSpeed(firstSensorIndex, i, deltaMs);
-              waitingForSecondSensor = false;
+              if (transitArmed) {
+                waitingForSecondSensor = true;
+                transitArmed = false;
+                firstSensorIndex = i;
+                firstBlockUs = sampleUs;
+                lastWaitLogUs = sampleUs;
+                if (kDebugTransitState) {
+                  Serial.print("Transit start sensor ");
+                  Serial.print(i);
+                  Serial.print(" at ");
+                  Serial.print(static_cast<float>(sampleUs) / 1000.0f, 3);
+                  Serial.println("ms");
+                }
+              }
             }
+          }
+          if (waitingForSecondSensor && i != firstSensorIndex) {
+            uint32_t deltaUs = sampleUs - firstBlockUs;
+            if (deltaUs >= kMinTransitUs) {
+              if (kDebugTransitState) {
+                Serial.print("Transit second sensor ");
+                Serial.print(i);
+                Serial.print(" delta=");
+                Serial.print(static_cast<float>(deltaUs) / 1000.0f, 3);
+                Serial.println("ms");
+              }
+              reportTransitSpeed(firstSensorIndex, i, deltaUs);
+            } else if (kDebugTransitState) {
+              Serial.print("Transit rejected delta=");
+              Serial.print(static_cast<float>(deltaUs) / 1000.0f, 3);
+              Serial.print("ms < min ");
+              Serial.print(static_cast<float>(kMinTransitUs) / 1000.0f, 3);
+              Serial.println("ms");
+            }
+            waitingForSecondSensor = false;
+            lastWaitLogUs = 0;
           }
         } else {
           objectBlocked[i] = false;
+          if (clearSamples[i] < UINT8_MAX) {
+            clearSamples[i] += 1;
+          }
+        }
+
+        if (clearSamples[0] >= kClearSamplesRequired &&
+            clearSamples[1] >= kClearSamplesRequired) {
+          if (!waitingForSecondSensor) {
+            transitArmed = true;
+          }
+        } else if (!waitingForSecondSensor) {
+          transitArmed = false;
         }
       } else {
         Serial.print("GetMultiRangingData error on sensor ");
@@ -265,13 +482,51 @@ void loop()
         Serial.print(": ");
         Serial.println(status);
         delay(100);
+      } else {
+        measurementStartUs[i] = micros();
       }
     }
   }
 
-  uint32_t nowMs = millis();
-  if (ledOn && static_cast<int32_t>(nowMs - ledOffMs) >= 0) {
-    digitalWrite(LED_BUILTIN, LOW);
-    ledOn = false;
+  uint32_t nowUs = micros();
+  if (waitingForSecondSensor && kDebugTransitState) {
+    uint32_t elapsedUs = nowUs - firstBlockUs;
+    if (elapsedUs >= kWaitLogIntervalUs &&
+        (lastWaitLogUs == 0 ||
+         (uint32_t)(nowUs - lastWaitLogUs) >= kWaitLogIntervalUs)) {
+      uint32_t elapsedSec = elapsedUs / kWaitLogIntervalUs;
+      uint32_t totalSec = kTransitTimeoutUs / kWaitLogIntervalUs;
+      Serial.print("Waiting for second sensor reading (");
+      Serial.print(elapsedSec);
+      Serial.print("/");
+      Serial.print(totalSec);
+      Serial.println(" seconds elapsed)");
+      lastWaitLogUs = nowUs;
+    }
   }
+  if (waitingForSecondSensor &&
+      (uint32_t)(nowUs - firstBlockUs) >= kTransitTimeoutUs) {
+    waitingForSecondSensor = false;
+    lastWaitLogUs = 0;
+    if (kDebugTransitState) {
+      Serial.println("Transit timeout");
+    }
+  }
+  if ((uint32_t)(nowUs - lastStatsReportUs) >= kStatsIntervalUs) {
+    for (uint8_t i = 0; i < kSensorCount; ++i) {
+      cacheMeasurementStats(i);
+      resetTimingStats(measurementStats[i]);
+      resetTimingStats(transferStats[i]);
+    }
+    lastStatsReportUs = nowUs;
+  }
+
+  bool anyObjectPresent = false;
+  for (uint8_t i = 0; i < kSensorCount; ++i) {
+    if (objectPresentState[i]) {
+      anyObjectPresent = true;
+      break;
+    }
+  }
+  digitalWrite(LED_BUILTIN, anyObjectPresent ? HIGH : LOW);
 }
