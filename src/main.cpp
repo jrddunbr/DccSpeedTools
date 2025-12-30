@@ -4,20 +4,28 @@
 
 #define XSHUT_PIN A1
 #define SERIAL_BAUD 115200
-constexpr uint32_t kReportIntervalMs = 250;
 constexpr uint8_t kMaxTargets = VL53L4CX_MAX_RANGE_RESULTS;
 constexpr uint8_t kSensorCount = 2;
 constexpr uint8_t kMuxAddress = 0x70;
 constexpr uint8_t kMuxPorts[kSensorCount] = {0, 1};
+constexpr uint16_t kSensorSpacingMm = 100;
+constexpr uint16_t kObjectMaxRangeMm = 300;
+constexpr float kHoScaleRatio = 87.0f;
+constexpr float kMmPerMeter = 1000.0f;
+constexpr float kMsPerSecond = 1000.0f;
+constexpr float kMpsToMph = 2.23693629f;
+constexpr uint32_t kLedBlinkMs = 50;
 
 VL53L4CX tof0(&Wire, XSHUT_PIN);
 VL53L4CX tof1(&Wire, XSHUT_PIN);
 VL53L4CX *const kSensors[kSensorCount] = {&tof0, &tof1};
 
-static uint32_t rangeSum[kSensorCount][kMaxTargets];
-static uint16_t rangeCount[kSensorCount][kMaxTargets];
-static uint16_t sampleCount[kSensorCount];
-static uint32_t lastReportMs = 0;
+static bool objectBlocked[kSensorCount] = {};
+static bool waitingForSecondSensor = false;
+static uint8_t firstSensorIndex = 0;
+static uint32_t firstBlockMs = 0;
+static bool ledOn = false;
+static uint32_t ledOffMs = 0;
 
 static bool selectMuxChannel(uint8_t channel)
 {
@@ -27,15 +35,6 @@ static bool selectMuxChannel(uint8_t channel)
   Wire.beginTransmission(kMuxAddress);
   Wire.write(1 << channel);
   return Wire.endTransmission() == 0;
-}
-
-static void resetAveraging(uint8_t sensorIndex)
-{
-  for (uint8_t i = 0; i < kMaxTargets; ++i) {
-    rangeSum[sensorIndex][i] = 0;
-    rangeCount[sensorIndex][i] = 0;
-  }
-  sampleCount[sensorIndex] = 0;
 }
 
 static void printUid(uint64_t uid)
@@ -91,42 +90,53 @@ static void printSensorInfo(VL53L4CX &sensor, uint8_t sensorIndex)
   }
 }
 
-static void accumulateRangingData(uint8_t sensorIndex,
-                                  const VL53L4CX_MultiRangingData_t &data)
+
+static bool findNearestObjectWithin(const VL53L4CX_MultiRangingData_t &data,
+                                    uint16_t maxRangeMm,
+                                    uint16_t *nearestRangeMm)
 {
+  bool found = false;
+  uint16_t best = 0;
   for (uint8_t i = 0; i < data.NumberOfObjectsFound && i < kMaxTargets; ++i) {
-    rangeSum[sensorIndex][i] += data.RangeData[i].RangeMilliMeter;
-    rangeCount[sensorIndex][i] += 1;
-  }
-  sampleCount[sensorIndex] += 1;
-}
-
-static void printAveragedRangingData(uint8_t sensorIndex)
-{
-  uint8_t objectsPrinted = 0;
-  for (uint8_t i = 0; i < kMaxTargets; ++i) {
-    if (rangeCount[sensorIndex][i] > 0) {
-      objectsPrinted += 1;
-    }
-  }
-
-  Serial.print("Sensor ");
-  Serial.print(sensorIndex);
-  Serial.print(" objects ");
-  Serial.println(objectsPrinted);
-
-  for (uint8_t i = 0; i < kMaxTargets; ++i) {
-    if (rangeCount[sensorIndex][i] == 0) {
+    uint16_t range = data.RangeData[i].RangeMilliMeter;
+    if (range == 0 || range > maxRangeMm) {
       continue;
     }
-    uint32_t avg = (rangeSum[sensorIndex][i] + (rangeCount[sensorIndex][i] / 2)) /
-                   rangeCount[sensorIndex][i];
-    Serial.print("Obj ");
-    Serial.print(i);
-    Serial.print(": distance=");
-    Serial.print(avg);
-    Serial.println("mm");
+    if (!found || range < best) {
+      best = range;
+      found = true;
+    }
   }
+
+  if (found && nearestRangeMm != nullptr) {
+    *nearestRangeMm = best;
+  }
+  return found;
+}
+
+static void reportTransitSpeed(uint8_t startSensor,
+                               uint8_t endSensor,
+                               uint32_t deltaMs)
+{
+  if (deltaMs == 0) {
+    return;
+  }
+  float deltaSeconds = static_cast<float>(deltaMs) / kMsPerSecond;
+  float distanceMeters = static_cast<float>(kSensorSpacingMm) / kMmPerMeter;
+  float speedMps = distanceMeters / deltaSeconds;
+  float scaleMph = speedMps * kMpsToMph * kHoScaleRatio;
+
+  Serial.print("Transit dir=");
+  Serial.print(startSensor);
+  Serial.print("->");
+  Serial.print(endSensor);
+  Serial.print(" delta=");
+  Serial.print(deltaMs);
+  Serial.print("ms: ");
+  Serial.print(speedMps, 3);
+  Serial.print(" m/s, ");
+  Serial.print(scaleMph, 1);
+  Serial.println(" scale mph");
 }
 
 void setup()
@@ -140,6 +150,9 @@ void setup()
   Serial.println("VL53L4CX initialization");
   Serial.println("Wiring: SDA=D14, SCL=D15, XSHUT=A1, VIN=3V3, GND=GND");
   Serial.println("Qwiic mux: address 0x70, sensors on ports 0 and 1");
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
   Wire.begin();
 
@@ -169,6 +182,14 @@ void setup()
 
     printSensorInfo(sensor, i);
 
+    status = sensor.VL53L4CX_StopMeasurement();
+    if (status != VL53L4CX_ERROR_NONE) {
+      Serial.print("StopMeasurement warning on sensor ");
+      Serial.print(i);
+      Serial.print(": ");
+      Serial.println(status);
+    }
+
     status = sensor.VL53L4CX_StartMeasurement();
     if (status != VL53L4CX_ERROR_NONE) {
       Serial.print("StartMeasurement failed on sensor ");
@@ -179,11 +200,7 @@ void setup()
         delay(100);
       }
     }
-
-    resetAveraging(i);
   }
-
-  lastReportMs = millis();
 }
 
 void loop()
@@ -209,10 +226,31 @@ void loop()
     }
 
     if (dataReady) {
+      uint32_t sampleMs = millis();
       VL53L4CX_MultiRangingData_t data;
       status = sensor.VL53L4CX_GetMultiRangingData(&data);
       if (status == VL53L4CX_ERROR_NONE) {
-        accumulateRangingData(i, data);
+        bool objectPresent =
+            findNearestObjectWithin(data, kObjectMaxRangeMm, nullptr);
+        if (objectPresent) {
+          if (!objectBlocked[i]) {
+            objectBlocked[i] = true;
+            ledOn = true;
+            ledOffMs = sampleMs + kLedBlinkMs;
+            digitalWrite(LED_BUILTIN, HIGH);
+            if (!waitingForSecondSensor) {
+              waitingForSecondSensor = true;
+              firstSensorIndex = i;
+              firstBlockMs = sampleMs;
+            } else if (i != firstSensorIndex) {
+              uint32_t deltaMs = sampleMs - firstBlockMs;
+              reportTransitSpeed(firstSensorIndex, i, deltaMs);
+              waitingForSecondSensor = false;
+            }
+          }
+        } else {
+          objectBlocked[i] = false;
+        }
       } else {
         Serial.print("GetMultiRangingData error on sensor ");
         Serial.print(i);
@@ -231,14 +269,9 @@ void loop()
     }
   }
 
-  uint32_t now = millis();
-  if ((now - lastReportMs) >= kReportIntervalMs) {
-    for (uint8_t i = 0; i < kSensorCount; ++i) {
-      if (sampleCount[i] > 0) {
-        printAveragedRangingData(i);
-        resetAveraging(i);
-      }
-    }
-    lastReportMs = now;
+  uint32_t nowMs = millis();
+  if (ledOn && static_cast<int32_t>(nowMs - ledOffMs) >= 0) {
+    digitalWrite(LED_BUILTIN, LOW);
+    ledOn = false;
   }
 }
