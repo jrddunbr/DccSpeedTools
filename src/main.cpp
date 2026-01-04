@@ -4,6 +4,13 @@
 #include <vl53l4cx_class.h>
 #include <string.h>
 
+#if !defined(PIN_NEOPIXEL) && defined(NEOPIXEL_PIN)
+#define PIN_NEOPIXEL NEOPIXEL_PIN
+#endif
+#if defined(PIN_NEOPIXEL)
+#include <Adafruit_NeoPixel.h>
+#endif
+
 #define XSHUT_PIN A1
 #define SERIAL_BAUD 115200
 constexpr char kApiVersion[] = "1.0.0";
@@ -67,6 +74,65 @@ static uint16_t sensorSpacingMm = kSensorSpacingMm;
 static uint32_t minTransitUs = kMinTransitUs;
 static uint32_t transitTimeoutUs = kTransitTimeoutUs;
 static uint16_t objectMaxRangeMm = kObjectMaxRangeMm;
+
+#if defined(PIN_NEOPIXEL)
+constexpr uint8_t kNeopixelBrightness = 32;
+
+enum class PixelState : uint8_t {
+  kUnknown = 0,
+  kIdle,
+  kArmed,
+  kBlocked,
+  kWaiting,
+};
+
+static Adafruit_NeoPixel neopixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+static PixelState lastPixelState = PixelState::kUnknown;
+static bool neopixelReady = false;
+
+static uint32_t neopixelColorForState(PixelState state)
+{
+  switch (state) {
+    case PixelState::kArmed:
+      return neopixel.Color(0, 255, 0);
+    case PixelState::kBlocked:
+      return neopixel.Color(255, 80, 0);
+    case PixelState::kWaiting:
+      return neopixel.Color(0, 0, 255);
+    case PixelState::kIdle:
+      return neopixel.Color(48, 48, 48);
+    case PixelState::kUnknown:
+    default:
+      return neopixel.Color(0, 0, 0);
+  }
+}
+
+static void initNeopixel()
+{
+#if defined(NEOPIXEL_POWER)
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, HIGH);
+#elif defined(PIN_NEOPIXEL_POWER)
+  pinMode(PIN_NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(PIN_NEOPIXEL_POWER, HIGH);
+#endif
+  neopixel.begin();
+  neopixel.setBrightness(kNeopixelBrightness);
+  neopixel.clear();
+  neopixel.show();
+  neopixelReady = true;
+}
+
+static void updateNeopixel(PixelState state)
+{
+  if (!neopixelReady || state == lastPixelState) {
+    return;
+  }
+  lastPixelState = state;
+  neopixel.setPixelColor(0, neopixelColorForState(state));
+  neopixel.show();
+}
+#endif
 
 struct TimingStats {
   uint32_t min;
@@ -843,6 +909,10 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
+#if defined(PIN_NEOPIXEL)
+  initNeopixel();
+#endif
+
   Wire.begin();
   Wire.setClock(kI2cClockHz);
 
@@ -1056,4 +1126,16 @@ void loop()
     }
   }
   digitalWrite(LED_BUILTIN, anyObjectPresent ? HIGH : LOW);
+
+#if defined(PIN_NEOPIXEL)
+  PixelState pixelState = PixelState::kIdle;
+  if (waitingForSecondSensor) {
+    pixelState = PixelState::kWaiting;
+  } else if (anyObjectPresent) {
+    pixelState = PixelState::kBlocked;
+  } else if (transitArmed) {
+    pixelState = PixelState::kArmed;
+  }
+  updateNeopixel(pixelState);
+#endif
 }

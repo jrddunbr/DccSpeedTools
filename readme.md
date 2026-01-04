@@ -27,6 +27,15 @@ pio run -t upload
 Use `pio run -e adafruit_metro_esp32s3` and `pio run -e adafruit_metro_esp32s3 -t upload` when targeting the Metro ESP32-S3.
 If PlatformIO asks to install or update the `espressif32` platform, allow it so the ESP32-S3 toolchain is available.
 
+## Neopixel State Colors
+
+If the dev board exposes a NeoPixel (for example, the Metro ESP32-S3), the firmware displays the transit state machine on it:
+
+* Dim white: idle/not armed yet (waiting for both sensors to be clear)
+* Green: armed/ready (both sensors clear)
+* Blue: waiting for the second sensor (transit in progress)
+* Amber: blocked (object present, not waiting for second sensor)
+
 ## Track Length
 
 Suggested straight track length: minimum 20cm, optimal 50cm or more.
