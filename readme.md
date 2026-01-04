@@ -6,7 +6,7 @@ This firmware is one part of a project designed to assist with DCC speed matchin
 
 This project currently expects the following:
 
-* An STM32 Nucleo F446RE development board (or a device more powerful than your typical ATMega 328p)
+* A supported dev board: STM32 Nucleo F446RE or Adafruit Metro ESP32-S3 N16R8 (or a device more powerful than your typical ATMega 328p)
 * A Sparkfun or equivalent I2C MUX board (TCA9548A)
 * A pair of Adafruit VL53L4CX ToF Distance sensors connected on MUX 0 and MUX 1
 * A connection between the dev board and a computer with an open USB port.
@@ -23,6 +23,9 @@ pio project init --ide clion
 pio run
 pio run -t upload
 ```
+
+Use `pio run -e adafruit_metro_esp32s3` and `pio run -e adafruit_metro_esp32s3 -t upload` when targeting the Metro ESP32-S3.
+If PlatformIO asks to install or update the `espressif32` platform, allow it so the ESP32-S3 toolchain is available.
 
 ## Track Length
 

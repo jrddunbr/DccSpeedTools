@@ -1,2 +1,4 @@
 .idea
 .pio
+.pio-core
+.pio-core/
